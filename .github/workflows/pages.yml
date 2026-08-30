@@ -1,10 +1,27 @@
-# PHASE 1 — THE BASELINE. This is brickwright-lite's build.yml shape, reduced
-# to the parts §2.1 is about: one concurrency group per REF, cancel-in-progress
-# false on pushes, build and deploy as two jobs in one run.
+# PHASE 2 — THE CANDIDATE. Three changes from the baseline, and nothing else.
 #
-# The claim under test is that a burst of pushes to this shape produces runs
-# that are cancelled while QUEUED — no runner, no verdict — and that the site
-# therefore skips commits.
+#  1. the RUN's concurrency group is keyed on the COMMIT, not the ref, so no
+#     push is ever cancelled while queued and every commit earns a verdict.
+#  2. the DEPLOY job carries the one shared group that is left. Serializing
+#     publication is still required; serializing VALIDATION never was.
+#  3. the deploy refuses to publish a tree older than the one already published.
+#     Ordering by queue release is not ordering by commit, and "the site lags
+#     several commits, arriving out of order" is what that costs.
+#
+# WHAT IS DELIBERATELY NOT CHANGED — the mismatched-tree hazard.
+#
+# The previous attempt at this fix took the live site down. The mechanism was a
+# per-JOB split: artifact names are unique within a RUN, not across runs, so two
+# jobs of one run writing `github-pages`, or a deploy job resolving that name
+# while a sibling was still uploading, publishes an index.html from one tree
+# beside chunks from another. Runs cannot do this to each other -- each run's
+# artifact is scoped to its own GITHUB_RUN_ID and deploy-pages resolves it there.
+#
+# So the invariant is: BUILD AND UPLOAD STAY IN ONE JOB, and the deploy takes the
+# artifact from its OWN run and never fetches one by name. Neither of the three
+# changes above touches that, which is why running builds in parallel is safe
+# here and was not safe then. This site names its own build in index.html so a
+# mismatch would be visible from outside as a 404 on the chunk.
 name: pages
 on:
   workflow_dispatch:
@@ -15,7 +32,7 @@ permissions:
   pages: write
   id-token: write
 concurrency:
-  group: pages-${{ github.event.pull_request.number || github.ref }}
+  group: pages-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build:
@@ -29,8 +46,6 @@ jobs:
           echo "window.__build='$sha';" > "site/chunks/app.$sha.js"
           printf '<!doctype html><meta charset="utf-8"><title>proof</title><p id=b>%s\n<script src="chunks/app.%s.js"></script>\n' "$sha" "$sha" > site/index.html
           echo "$sha" > site/BUILD
-      # Stand in for lite's ~12-minute build, so a burst of pushes actually
-      # overlaps instead of arriving one at a time.
       - name: Take as long as a real build takes (scaled)
         run: sleep 60
       - uses: actions/upload-pages-artifact@v3
@@ -40,11 +55,43 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pages: write
       id-token: write
+      deployments: read
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # The guard runs INSIDE the job, so it is evaluated after the queue lets
+      # this deploy through -- by which time a newer commit may already have
+      # published. Evaluating it before queuing would answer the wrong question.
+      - name: Refuse to publish a tree older than the published one
+        id: order
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          published=$(gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=1" \
+            --jq '.[0].sha // empty')
+          echo "published=$published  ours=$GITHUB_SHA"
+          if [ -z "$published" ] || [ "$published" = "$GITHUB_SHA" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # `ahead` means the published commit is ahead of ours: it is newer, and
+          # publishing would move the site BACKWARDS. `behind`, `identical` and
+          # `diverged` all deploy -- for diverged there is no ordering to respect.
+          status=$(gh api "repos/${{ github.repository }}/compare/${GITHUB_SHA}...${published}" --jq '.status')
+          echo "compare ours...published = $status"
+          if [ "$status" = "ahead" ]; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping: $published is already published and is newer than $GITHUB_SHA"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
       - id: deployment
+        if: steps.order.outputs.stale != 'true'
         uses: actions/deploy-pages@v4
