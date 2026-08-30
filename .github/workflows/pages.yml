@@ -1,0 +1,50 @@
+# PHASE 1 — THE BASELINE. This is brickwright-lite's build.yml shape, reduced
+# to the parts §2.1 is about: one concurrency group per REF, cancel-in-progress
+# false on pushes, build and deploy as two jobs in one run.
+#
+# The claim under test is that a burst of pushes to this shape produces runs
+# that are cancelled while QUEUED — no runner, no verdict — and that the site
+# therefore skips commits.
+name: pages
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build a site that names its own build
+        run: |
+          sha=$(git rev-parse --short=9 HEAD)
+          mkdir -p site/chunks
+          echo "window.__build='$sha';" > "site/chunks/app.$sha.js"
+          printf '<!doctype html><meta charset="utf-8"><title>proof</title><p id=b>%s\n<script src="chunks/app.%s.js"></script>\n' "$sha" "$sha" > site/index.html
+          echo "$sha" > site/BUILD
+      # Stand in for lite's ~12-minute build, so a burst of pushes actually
+      # overlaps instead of arriving one at a time.
+      - name: Take as long as a real build takes (scaled)
+        run: sleep 60
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
