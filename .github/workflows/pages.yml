@@ -75,8 +75,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          published=$(gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=1" \
-            --jq '.[0].sha // empty')
+          # `--jq` with OUR OWN SHA FILTERED OUT, and that filter is the whole
+          # trap. Declaring `environment: github-pages` on this job makes GitHub
+          # create the environment's deployment record when the JOB STARTS —
+          # before any step runs. A guard that simply reads the newest deployment
+          # therefore reads ITSELF, concludes it is up to date, and publishes.
+          # Measured 2026-08-30 on run 33295873557 attempt 2: the guard printed
+          # `published=654edac ours=654edac` and moved the live site BACKWARDS
+          # from ae89f11 to 654edac — the exact failure it was written to prevent,
+          # with a green check on it. Ours can appear more than once (a re-run),
+          # so every occurrence goes.
+          published=$(gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=30" \
+            --jq --arg ours "$GITHUB_SHA" '[.[] | select(.sha != $ours)] | .[0].sha // empty')
           echo "published=$published  ours=$GITHUB_SHA"
           if [ -z "$published" ] || [ "$published" = "$GITHUB_SHA" ]; then
             echo "stale=false" >> "$GITHUB_OUTPUT"; exit 0
