@@ -85,8 +85,10 @@ jobs:
           # from ae89f11 to 654edac — the exact failure it was written to prevent,
           # with a green check on it. Ours can appear more than once (a re-run),
           # so every occurrence goes.
+          # `gh api --jq` takes ONE argument and no `--arg`; it fails with
+          # "accepts 1 arg(s), received 4". Pipe to jq instead.
           published=$(gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=30" \
-            --jq --arg ours "$GITHUB_SHA" '[.[] | select(.sha != $ours)] | .[0].sha // empty')
+            | jq -r --arg ours "$GITHUB_SHA" '[.[] | select(.sha != $ours)] | .[0].sha // empty')
           echo "published=$published  ours=$GITHUB_SHA"
           if [ -z "$published" ] || [ "$published" = "$GITHUB_SHA" ]; then
             echo "stale=false" >> "$GITHUB_OUTPUT"; exit 0
